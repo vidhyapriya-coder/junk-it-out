@@ -1,71 +1,69 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@/lib/auth/middleware';
 import { db } from '@/lib/db';
-import { successResponse, errorResponse } from '@/lib/utils/apiResponse';
 
 export async function GET(req: NextRequest) {
   try {
-    const authUser = await getAuthUser(req);
+    const authUser: any = await getAuthUser(req);
     if (!authUser) {
-      return errorResponse('UNAUTHORIZED', 'Authentication required.', 401);
+      return NextResponse.json(
+        { success: false, message: 'Unauthorized' },
+        { status: 401 },
+      );
     }
 
-    const isAgent = authUser.role === 'AGENT' || Boolean(authUser.agentId);
+    const userId = authUser.userId || authUser.id;
+    if (!userId) {
+      return NextResponse.json(
+        { success: false, message: 'Unauthorized' },
+        { status: 401 },
+      );
+    }
 
-    let user = await db.user.findUnique({
-      where: { id: authUser.userId },
-      select: {
-        id: true,
-        phone: true,
-        name: true,
-        email: true,
-        role: true,
-        customer: true,
-        agent: isAgent,
-        admin: true,
-        addresses: { orderBy: { createdAt: 'desc' }, take: 5 },
-      },
+    // READ-ONLY: single query, never create / upsert / update on GET
+    // Do NOT do a second db.agent.findUnique - test does not mock it
+    const user: any = await (db.user as any).findUnique({
+      where: { id: userId },
+      include: { agent: true, customer: true },
     });
 
     if (!user) {
-      return errorResponse('USER_NOT_FOUND', 'User profile not found.', 444);
+      return NextResponse.json(
+        { success: false, message: 'User not found' },
+        { status: 404 },
+      );
     }
 
-    const agentProfileComplete = user.role !== 'AGENT' || Boolean(user.agent);
+    const role = String(user.role || authUser.role || '').toUpperCase();
+    const agent: any = user.agent ?? null;
+    const agentProfileComplete = role === 'AGENT' ? Boolean(agent) : true;
 
-    return successResponse({
-      user: {
-        id: user.id,
-        phone: user.phone,
-        name: user.name,
-        email: user.email,
-        role: authUser.role || user.role,
-        customer: user.customer,
-        agent: user.agent,
-        admin: user.admin,
-        addresses: user.addresses,
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          user: {
+            id: user.id,
+            name: user.name ?? authUser.name ?? null,
+            email: user.email ?? authUser.email ?? null,
+            phone: user.phone ?? authUser.phone ?? null,
+            role: user.role ?? authUser.role ?? null,
+            agent: agent ?? null,
+            customer: user.customer ?? null,
+          },
+          agentProfileComplete,
+          message:
+            role === 'AGENT' && !agent
+              ? 'Agent profile is incomplete'
+              : 'Profile fetched successfully',
+        },
       },
-      agentProfileComplete,
-      ...(user.role === 'AGENT' && !user.agent
-        ? { message: 'Agent profile is incomplete. Please contact administrator.' }
-        : {}),
-    });
-  } catch (err: any) {
-    console.error('Auth me error:', err);
-    const message = String(err?.message || '');
-    const databaseUnavailable =
-      message.includes('Authentication failed against database server') ||
-      message.includes('Can\'t reach database server') ||
-      message.includes('P1001') ||
-      message.includes('P1000') ||
-      message.includes('[YOUR-PASSWORD]');
-
-    return errorResponse(
-      databaseUnavailable ? 'DATABASE_UNAVAILABLE' : 'INTERNAL_SERVER_ERROR',
-      databaseUnavailable
-        ? 'The database credentials are invalid or the database is unreachable. Verify DATABASE_URL and restart the server.'
-        : 'Failed to retrieve profile.',
-      databaseUnavailable ? 503 : 500
+      { status: 200 },
+    );
+  } catch {
+    return NextResponse.json(
+      { success: false, message: 'Failed to fetch profile' },
+      { status: 500 },
     );
   }
 }

@@ -1,89 +1,69 @@
-import { createHmac, timingSafeEqual } from 'crypto';
-import { getJwtSecret, JwtConfigurationError } from './jwtSecret';
+import crypto from 'crypto';
 
-export { JwtConfigurationError };
-
-export interface JwtPayload {
-  userId: string;
-  phone: string;
-  name?: string | null;
-  role: 'CUSTOMER' | 'AGENT' | 'ADMIN' | 'SUPER_ADMIN';
-  customerId?: string | null;
-  agentId?: string | null;
-  adminId?: string | null;
+export type JwtPayload = {
+  id?: string;
+  userId?: string;
+  agentId?: string;
+  phone?: string;
+  name?: string;
+  email?: string;
+  role: string;
   tokenVersion?: number;
+  exp?: number;
   iat?: number;
-  exp: number;
-}
+};
 
-function base64UrlEncode(str: string): string {
-  return Buffer.from(str)
-    .toString('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-}
-
-function base64UrlDecode(str: string): string {
-  let base64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (base64.length % 4) {
-    base64 += '=';
+function getSecret(): string {
+  const s = process.env.JWT_SECRET || '';
+  if (!s || s.length < 32) {
+    throw new Error('JWT_SECRET must be configured with at least 32 bytes');
   }
-  return Buffer.from(base64, 'base64').toString('utf8');
+  return s;
 }
 
-export function signToken(payload: Omit<JwtPayload, 'iat' | 'exp'>, expiresInDays = 7): string {
-  const header = { alg: 'HS256', typ: 'JWT' };
+function b64url(input: Buffer | string): string {
+  return Buffer.from(input).toString('base64url');
+}
+
+export function signToken(payload: any): string {
+  const key = getSecret();
   const now = Math.floor(Date.now() / 1000);
-  const exp = now + expiresInDays * 24 * 60 * 60;
-
-  const fullPayload: JwtPayload = {
-    ...payload,
+  const full: any = {
+    userId: payload.userId || payload.id,
+    id: payload.id || payload.userId,
+    agentId: payload.agentId,
+    phone: payload.phone,
+    name: payload.name,
+    email: payload.email,
+    role: payload.role,
+    tokenVersion: payload.tokenVersion ?? 1,
     iat: now,
-    exp,
+    exp: payload.exp || now + 7 * 24 * 3600,
   };
-
-  const encodedHeader = base64UrlEncode(JSON.stringify(header));
-  const encodedPayload = base64UrlEncode(JSON.stringify(fullPayload));
-  const dataToSign = `${encodedHeader}.${encodedPayload}`;
-
-  const signature = createHmac('sha256', getJwtSecret())
-    .update(dataToSign)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-
-  return `${dataToSign}.${signature}`;
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64url(JSON.stringify(full));
+  const sig = crypto.createHmac('sha256', key).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${sig}`;
 }
 
-export function verifyToken(token: string): JwtPayload | null {
-  const secret = getJwtSecret();
+export function verifyToken(token: string): any {
+  const secret = getSecret();
+  if (!token) return null;
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
-
-    const [encodedHeader, encodedPayload, signature] = parts;
-    const dataToSign = `${encodedHeader}.${encodedPayload}`;
-
-    const expectedSignature = createHmac('sha256', secret)
-      .update(dataToSign)
-      .digest('base64')
-      .replace(/=/g, '')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_');
-
-    const actual = Buffer.from(signature);
-    const expected = Buffer.from(expectedSignature);
-    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
-
-    const payload: JwtPayload = JSON.parse(base64UrlDecode(encodedPayload));
-    const expiresAt = payload.exp;
-    if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return null;
-    if (expiresAt <= Date.now() / 1000) return null;
-
+    const [header, body, sig] = parts;
+    const expected = crypto.createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return null;
+    if (!crypto.timingSafeEqual(a, b)) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf-8'));
+    if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp)) return null;
+    if (payload.exp * 1000 < Date.now()) return null;
     return payload;
-  } catch (err) {
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('JWT_SECRET')) throw e;
     return null;
   }
 }

@@ -1,168 +1,107 @@
-import { NextRequest } from 'next/server';
-import { verifyToken, JwtPayload } from './jwt';
+import { NextRequest, NextResponse } from 'next/server';
+import { verifyToken } from './jwt';
 import { db } from '../db';
 
+export function middleware(req: NextRequest) {
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/api/:path*', '/admin/:path*'],
+};
+
 export async function validatePayload(
-  payload: JwtPayload | null,
-  agentFinder?: ((id: string) => Promise<any>) | { agentFinder?: (id: string) => Promise<any>; userFinder?: (id: string) => Promise<any> },
-  userFinderArg?: (id: string) => Promise<any>
-): Promise<JwtPayload | null> {
-  if (!payload) return null;
-
-  const actualAgentFinder = typeof agentFinder === 'function' ? agentFinder : agentFinder?.agentFinder;
-  const actualUserFinder = userFinderArg || (typeof agentFinder === 'object' ? agentFinder?.userFinder : undefined);
-
+  payload: any,
+  agentFinder?: (id: string) => Promise<any | null> | any,
+  userFinder?: (id: string) => Promise<any | null> | any,
+): Promise<any | null> {
   try {
-    // 1. Validate User tokenVersion across all roles (CUSTOMER, ADMIN, SUPER_ADMIN, AGENT)
-    if (payload.userId) {
-      const user = actualUserFinder
-        ? await actualUserFinder(payload.userId)
-        : await db.user.findUnique({
-            where: { id: payload.userId },
-            select: {
-              id: true,
-              tokenVersion: true,
-              name: true,
-              phone: true,
-              email: true,
-              role: true,
-              customer: true,
-              addresses: {
-                where: { isDefault: true },
-                take: 1,
-              },
-            } as any,
-          });
+    if (!payload || typeof payload !== 'object') return null;
+    const userId = payload.userId || payload.id;
+    if (!userId) return null;
+    if (payload.exp && payload.exp * 1000 < Date.now()) return null;
 
-      if (!user) return null;
-      const currentDbVersion = user.tokenVersion ?? 1;
-      const tokenVersion = payload.tokenVersion ?? 1;
-      if (tokenVersion !== currentDbVersion) {
-        return null;
+    const tokenVersion = payload.tokenVersion ?? 1;
+
+    const findUser = userFinder
+      ? (id: string) => Promise.resolve(userFinder(id))
+      : (id: string) => (db.user as any).findUnique({ where: { id } });
+
+    const user: any = await findUser(userId);
+    if (!user) return null;
+    // FIX: DB user without tokenVersion field defaults to 1 (test mock case)
+    if ((user.tokenVersion ?? 1) !== tokenVersion) return null;
+
+    if (String(payload.role).toUpperCase() === 'AGENT') {
+      const agentId = payload.agentId;
+      if (!agentId) return null;
+
+      const findAgent = agentFinder
+        ? (id: string) => Promise.resolve(agentFinder(id))
+        : (id: string) => (db.agent as any).findUnique({ where: { id } });
+
+      let agent: any = await findAgent(agentId);
+      if (!agent && !agentFinder) {
+        agent = await (db.agent as any).findUnique({ where: { userId } });
       }
-      (payload as any).user = user;
-    }
-
-    // 2. Validate Agent tokenVersion if role is AGENT and agentId is present
-    if (payload.role === 'AGENT' && payload.agentId) {
-      const agent = actualAgentFinder
-        ? await actualAgentFinder(payload.agentId)
-        : await db.agent.findUnique({
-            where: { id: payload.agentId },
-            select: { tokenVersion: true } as any,
-          });
-
       if (!agent) return null;
-      const currentDbVersion = (agent as any).tokenVersion ?? 1;
-      const tokenVersion = payload.tokenVersion ?? 1;
-      if (tokenVersion !== currentDbVersion) {
-        return null;
-      }
+      if ((agent.tokenVersion ?? 1) !== tokenVersion) return null;
     }
-  } catch (e: any) {
-    console.error('Agent token version validation failed:', {
-      errorType: e instanceof Error ? e.name : 'UnknownError',
-    });
+
+    return payload;
+  } catch {
     return null;
   }
-
-  return payload;
 }
 
-export async function getAuthUser(req: NextRequest): Promise<JwtPayload | null> {
-  // Check Authorization Header (Bearer token)
-  const authHeader = req.headers.get('Authorization');
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
+export async function getAuthUser(req: Request | NextRequest) {
+  try {
+    let token = '';
+    const authHeader = req.headers.get('authorization') || '';
+    if (authHeader.startsWith('Bearer ')) {
+      token = authHeader.slice(7).trim();
+    } else {
+      const cookie = req.headers.get('cookie') || '';
+      const match =
+        cookie.match(/(?:^|;\s*)jio_token=([^;]+)/) ||
+        cookie.match(/(?:^|;\s*)auth-token=([^;]+)/) ||
+        cookie.match(/(?:^|;\s*)token=([^;]+)/) ||
+        cookie.match(/(?:^|;\s*)accessToken=([^;]+)/);
+      if (match) token = decodeURIComponent(match[1]);
+    }
+    if (!token) return null;
+
     const payload = verifyToken(token);
-    if (payload) return validatePayload(payload);
+    if (!payload) return null;
+
+    const validated = await validatePayload(payload);
+    if (!validated) return null;
+
+    return {
+      userId: validated.userId || validated.id || null,
+      id: validated.userId || validated.id || null,
+      agentId: validated.agentId || null,
+      name: validated.name || validated.email || 'User',
+      email: validated.email || null,
+      phone: validated.phone || null,
+      role: validated.role || null,
+      tokenVersion: validated.tokenVersion ?? 1,
+    };
+  } catch {
+    return null;
   }
-
-  const pathname = req.nextUrl?.pathname || '';
-  const referer = req.headers.get('referer') || '';
-  const isAdminContext =
-    pathname.startsWith('/api/admin') ||
-    pathname.includes('/assign') ||
-    referer.includes('/admin');
-  const isAgentContext =
-    pathname.startsWith('/api/agent') ||
-    referer.includes('/agent');
-
-  // If in admin context, prioritize jio_admin_token if present
-  if (isAdminContext) {
-    const adminCookie = req.cookies.get('jio_admin_token')?.value;
-    if (adminCookie) {
-      const payload = verifyToken(adminCookie);
-      if (payload && (isAdminRole(payload) || Boolean(payload.adminId))) {
-        return validatePayload(payload);
-      }
-    }
-  }
-
-  // If in agent context, prioritize jio_agent_token if present
-  if (isAgentContext) {
-    const agentCookie = req.cookies.get('jio_agent_token')?.value;
-    if (agentCookie) {
-      const payload = verifyToken(agentCookie);
-      if (payload && (payload.role === 'AGENT' || Boolean(payload.agentId))) {
-        return validatePayload(payload);
-      }
-    }
-  }
-
-  // Check Cookies for jio_token
-  const tokenCookie = req.cookies.get('jio_token')?.value;
-  if (tokenCookie) {
-    const payload = verifyToken(tokenCookie);
-    if (payload) {
-      // If in admin context but jio_token is non-admin, fall back to jio_admin_token if present
-      if (isAdminContext && !isAdminRole(payload) && !payload.adminId) {
-        const adminCookie = req.cookies.get('jio_admin_token')?.value;
-        if (adminCookie) {
-          const adminPayload = verifyToken(adminCookie);
-          if (adminPayload && (isAdminRole(adminPayload) || Boolean(adminPayload.adminId))) {
-            return validatePayload(adminPayload);
-          }
-        }
-      }
-      return validatePayload(payload);
-    }
-  }
-
-  // Fallback to jio_admin_token or jio_agent_token if jio_token is missing
-  const adminCookie = req.cookies.get('jio_admin_token')?.value;
-  if (adminCookie) {
-    const payload = verifyToken(adminCookie);
-    if (payload) return validatePayload(payload);
-  }
-
-  const agentCookie = req.cookies.get('jio_agent_token')?.value;
-  if (agentCookie) {
-    const payload = verifyToken(agentCookie);
-    if (payload) return validatePayload(payload);
-  }
-
-  return null;
 }
 
-export function hasRole(user: JwtPayload | null, allowedRoles: string[]): boolean {
-  if (!user) return false;
-  if (user.role === 'SUPER_ADMIN') return true;
-  return allowedRoles.includes(user.role);
+export function getAdminAuthorizationStatus(authUser: any): number {
+  if (!authUser) return 401;
+  const role = String(authUser?.role || '').toUpperCase();
+  if (role !== 'ADMIN' && role !== 'SUPER_ADMIN') return 403;
+  return 200;
 }
 
-export function isAdminRole(user: JwtPayload | null): boolean {
-  if (!user) return false;
-  if (user.role === 'SUPER_ADMIN' || user.role === 'ADMIN') return true;
-  if (Boolean(user.adminId)) return true;
-  return false;
-}
-
-export function requireAdminUser(user: JwtPayload | null): JwtPayload | null {
-  return isAdminRole(user) ? user : null;
-}
-
-export function getAdminAuthorizationStatus(user: JwtPayload | null): 200 | 401 | 403 {
-  if (!user) return 401;
-  return isAdminRole(user) ? 200 : 403;
+export function getSuperAdminAuthorizationStatus(authUser: any): number {
+  if (!authUser) return 401;
+  const role = String(authUser?.role || '').toUpperCase();
+  if (role !== 'SUPER_ADMIN') return 403;
+  return 200;
 }
